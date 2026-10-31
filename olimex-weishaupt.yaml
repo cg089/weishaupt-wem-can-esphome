@@ -1,0 +1,1958 @@
+# Weishaupt WTC-GW (WEM-Systemgeraet) am CAN-Bus -> Home Assistant
+# Board: Olimex ESP32-EVB (ESP32-WROOM-32E, 4 MB Flash, CAN-Transceiver onboard, USB ueber CH340), per LAN
+# Firmware-Basis: https://github.com/jvejmelka/weishaupt-wem-can-esphome (Komponente in components)
+#
+#   CAN TX = GPIO5   CAN RX = GPIO35 (Olimex ESP32-EVB, siehe Schaltplan)   50 kbps
+#   Dallas-Temperaturfuehler an GPIO16 (UEXT Pin 5)
+#   Geschrieben wird NIE auf den Kessel, nur an den WEM (Knoten 1, MI 01-03); "Eigene CAN-Anfragen" sind beim
+#   ersten Start aus (nur Mithoeren).
+#
+# Alles in einer Datei: die Pakete des Originals (pakete/kessel, warmwasser, wem-schalten, warmwasser-schalten) sind
+# hier zusammengefuehrt und fuer das Olimex-Board angepasst (LAN statt WLAN, CAN-Pins, kein SD/LittleFS), dazu kommen
+# kraiz-per-can (kraiz-Werte per CAN) und die Dallas-Fuehler. Die Abschnitte tragen jeweils "aus Paket ...".
+# Nur der C++-Teil steht ausserhalb, weil YAML ihn nicht aufnehmen kann:
+#   components/weishaupt_can/                    Komponente (Zustand und Logik der Firmware)
+#   weishaupt-helfer.h                           Hilfsfunktionen: kraiz-Werte per CAN, Wertetexte, Warn-/Fehlercodes
+# Enthaltene Funktionen: kessel (Pflicht), warmwasser, wem-schalten, warmwasser-schalten, kraiz-per-can, temperaturen.
+# Weggelassen: mqtt, app, verdacht, zusatz, json-lesen (optional, siehe INSTALL.md).
+
+substitutions:
+  geraet: olimex-weishaupt
+  anzeigename: Weishaupt Heizung
+  friendly_name: Weishaupt Heizung
+  firmware: "v42-dev vom 28.10.2026 (Olimex ESP32-EVB)"
+  # RESTORE_DEFAULT_OFF = nur mithoeren, RESTORE_DEFAULT_ON = eigene Leseanfragen im Weishaupt-Takt
+  can_anfragen_start: RESTORE_DEFAULT_OFF
+  # aus Paket kessel:
+  anlaufpause_min: "10"
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [weishaupt_can]
+
+esphome:
+  name: ${geraet}
+  friendly_name: ${anzeigename}
+  includes:
+    - weishaupt-helfer.h
+  on_boot:
+    priority: -100
+    then:
+      # --- aus Paket wem-schalten ---
+      - lambda: |-
+          #ifdef USE_MQTT
+          mqtt::global_mqtt_client->subscribe("${geraet}/cmd/heizkreis", [](const std::string &t, const std::string &p) {
+            id(befehl_eingang)->execute(1, p, std::string("MQTT"));
+          });
+          mqtt::global_mqtt_client->subscribe("${geraet}/cmd/can_schreiben", [](const std::string &t, const std::string &p) {
+            id(can_frei_senden)->execute(p);
+          });
+          mqtt::global_mqtt_client->subscribe("${geraet}/cmd/sd_datei", [](const std::string &t, const std::string &p) {
+            id(sd_holen)->execute(p);
+          });
+          #endif
+      # --- aus Paket warmwasser-schalten ---
+      - lambda: |-
+          #ifdef USE_MQTT
+          mqtt::global_mqtt_client->subscribe("${geraet}/cmd/warmwasser", [](const std::string &t, const std::string &p) {
+            id(befehl_eingang)->execute(2, p, std::string("MQTT"));
+          });
+          #endif
+      # --- aus Paket kraiz-per-can ---
+      - lambda: |-
+          kc::anlegen(1, 0x297E, 4, false, 1.0f, 60, [](int32_t r, float v) { id(kc_betriebsart_hk1_aktuell).publish_state(kc::text_BETRIEBSART_AKTUELL_MAP((int) r)); });
+          kc::anlegen(1, 0x297E, 5, false, 1.0f, 60, [](int32_t r, float v) { id(kc_status_hk1).publish_state(kc::text_STATUS_HK_MAP((int) r)); });
+          kc::anlegen(1, 0x2982, 2, false, 1.0f, 600, [](int32_t r, float v) { id(kc_sowi_umschaltung_hk1).publish_state(kc::text_SOWI_UMSCHALTUNG_MAP((int) r)); });
+          kc::anlegen(1, 0x293B, 2, true, 0.1f, 600, [](int32_t r, float v) { id(kc_raumsolltemperatur_komfort).publish_state(v); });
+          kc::anlegen(1, 0x293A, 2, true, 0.1f, 600, [](int32_t r, float v) { id(kc_raumsolltemperatur_normal).publish_state(v); });
+          kc::anlegen(1, 0x2939, 2, true, 0.1f, 600, [](int32_t r, float v) { id(kc_raumsolltemperatur_absenk).publish_state(v); });
+          kc::anlegen(1, 0x296B, 2, true, 0.1f, 600, [](int32_t r, float v) { id(kc_vorlaufsolltemperatur_komfort).publish_state(v); });
+          kc::anlegen(1, 0x296A, 2, true, 0.1f, 600, [](int32_t r, float v) { id(kc_vorlaufsolltemperatur_normal).publish_state(v); });
+          kc::anlegen(1, 0x2969, 2, true, 0.1f, 600, [](int32_t r, float v) { id(kc_vorlaufsolltemperatur_absenk).publish_state(v); });
+          kc::anlegen(1, 0x292C, 2, true, 0.1f, 600, [](int32_t r, float v) { id(kc_vorlaufsolltemperatur_sonderniveau).publish_state(v); });
+          kc::anlegen(1, 0x2959, 2, true, 0.1f, 60, [](int32_t r, float v) { id(kc_vorlaufsolltemperatur_aktuell).publish_state(v); });
+          kc::anlegen(1, 0x2A69, 2, false, 1.0f, 60, [](int32_t r, float v) { id(kc_status_warmwasser).publish_state(kc::text_STATUS_WW_MAP((int) r)); });
+          kc::anlegen(1, 0x2A49, 2, false, 1.0f, 60, [](int32_t r, float v) { id(kc_warmwasser_push).publish_state(kc::text_PUMPE_MAP((int) r)); });
+          kc::anlegen(1, 0x2A38, 2, true, 0.1f, 600, [](int32_t r, float v) { id(kc_wwsolltemperatur_absenk).publish_state(v); });
+          kc::anlegen(1, 0x2A51, 2, false, 1.0f, 60, [](int32_t r, float v) { id(kc_pumpe_warmwasser).publish_state(kc::text_PUMPE_MAP((int) r)); });
+          kc::anlegen(1, 0x269D, 1, true, 0.1f, 60, [](int32_t r, float v) { id(kc_waermeanforderung_warmwasser).publish_state(v); });
+          kc::anlegen(1, 0x2A57, 2, true, 0.1f, 60, [](int32_t r, float v) { id(kc_ruecklauftemperatur_zirkulation).publish_state(v); });
+          kc::anlegen(1, 0x271F, 2, true, 0.1f, 60, [](int32_t r, float v) { id(kc_plattenwaermetauschertemperatur_b2).publish_state(v); });
+          kc::anlegen(1, 0x2660, 2, true, 0.1f, 60, [](int32_t r, float v) { id(kc_pufferspeicher_temperatur_oben).publish_state(v); });
+          kc::anlegen(1, 0x2661, 2, true, 0.1f, 60, [](int32_t r, float v) { id(kc_pufferspeicher_temperatur_unten).publish_state(v); });
+          kc::anlegen(1, 0x28F9, 2, false, 0.01f, 60, [](int32_t r, float v) { id(kc_n1_vorgabe_ethernet).publish_state(v); });
+          kc::anlegen(1, 0x2712, 0, true, 0.1f, 300, [](int32_t r, float v) { id(kc_kaskade_sollwert_hz).publish_state(v); });
+          kc::anlegen(1, 0x2713, 0, true, 0.1f, 300, [](int32_t r, float v) { id(kc_kaskade_sollwert_ww).publish_state(v); });
+          kc::anlegen(1, 0x271C, 0, false, 0.01f, 300, [](int32_t r, float v) { id(kc_kaskade_sollmodulation_hz).publish_state(v); });
+          kc::anlegen(1, 0x271D, 0, false, 0.01f, 300, [](int32_t r, float v) { id(kc_kaskade_sollmodulation_ww).publish_state(v); });
+          kc::anlegen(1, 0x27E4, 2, false, 1.0f, 600, [](int32_t r, float v) { id(kc_folgewechsel).publish_state(kc::text_FOLGEWECHSEL_MAP((int) r)); });
+          kc::anlegen(1, 0x27E6, 2, false, 1.0f, 600, [](int32_t r, float v) { id(kc_wechselzeit).publish_state(v); });
+          kc::anlegen(1, 0x27FE, 2, true, 0.1f, 600, [](int32_t r, float v) { id(kc_kaskade_abgleichtemperatur).publish_state(v); });
+          kc::anlegen(2, 0x2739, 0, false, 1.0f, 60, [](int32_t r, float v) { id(kc_betriebsphase).publish_state(kc::text_BETRIEBSPHASE_WTC_MAP((int) r)); });
+
+esp32:
+  board: esp32-evb
+  framework:
+    type: esp-idf
+
+# LAN statt WLAN: LAN8720 des Olimex ESP32-EVB (Pins laut ESPHome-Doku fuer dieses Board)
+ethernet:
+  type: LAN8720
+  mdc_pin: GPIO23
+  mdio_pin: GPIO18
+  clk:
+    pin: GPIO0
+    mode: CLK_EXT_IN
+  phy_addr: 0
+  power_pin: GPIO12
+
+# CAN-Pins des Olimex ESP32-EVB (GPIO5/GPIO35) stehen unten im Abschnitt canbus; das Original (WeAct CAN485) nutzt GPIO27/26.
+# SD-Karte (WeAct-Pins) und LittleFS (braucht 8 MB Flash) gibt es auf dem ESP32-EVB nicht
+weishaupt_can:
+  id: wcan
+  canbus_id: my_can_bus
+  time_id: uhr
+  anlaufpause: ${anlaufpause_min}min
+  sd_karte: false
+  dateisystem: false
+
+logger:
+  level: DEBUG
+  logs:
+    canbus: ERROR
+
+# Enable Home Assistant API
+api:
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+web_server:
+  port: 80
+  version: 3          # Pflicht: sorting_groups unten brauchen Version 3
+  local: true         # JS/CSS eingebettet, Seite geht auch ohne Internet
+  auth:
+    type: digest
+    username: admin
+    password: !secret web_server_password
+  sorting_groups:
+    # --- aus Paket kessel ---
+    - id: g_kessel
+      name: "Kessel"
+      sorting_weight: 10
+    - id: g_betrieb
+      name: "Betriebsarten und Sollwerte"
+      sorting_weight: 20
+    - id: g_energie
+      name: "Energie"
+      sorting_weight: 30
+    - id: g_lesen
+      name: "Lesebefehl (nur lesen)"
+      sorting_weight: 40
+    - id: g_codes
+      name: "Zahlencodes (fuer Grafana/InfluxDB)"
+      sorting_weight: 80
+    - id: g_diag
+      name: "Diagnose"
+      sorting_weight: 90
+    - id: g_einst
+      name: "Einstellungen"
+      sorting_weight: 95
+    - id: g_fw
+      name: "Firmware"
+      sorting_weight: 100
+    # --- aus Paket wem-schalten ---
+    - id: g_schalten
+      name: "Schalten (ueber WEM, Kontrolle am Bus)"
+      sorting_weight: 5
+    - id: g_schreiben
+      name: "Schreibbefehl ueber WEM (Experten)"
+      sorting_weight: 45
+    - id: g_can_schreiben
+      name: "Schreiben per CAN (experimentell, ab Werk aus)"
+      sorting_weight: 46
+    - id: g_sd
+      name: "SD-Karte des WEM (Dateien lesen)"
+      sorting_weight: 47
+    # --- aus Paket kraiz-per-can ---
+    - id: g_kraiz
+      name: "Weitere Werte (wie kraiz/JSON, per CAN)"
+      sorting_weight: 35
+    # --- aus Paket temperaturen ---
+    - id: g_dallas
+      name: "Temperaturfühler (Dallas)"
+      sorting_weight: 36
+
+time:
+  - platform: sntp
+    id: uhr
+    timezone: Europe/Berlin
+    servers: [0.pool.ntp.org, 1.pool.ntp.org]
+
+# Dallas-Temperaturfuehler (DS18B20) an GPIO16 (UEXT Pin 5) am Olimex ESP32-EVB.
+# Alle fuenf Fuehler haengen parallel an einem Bus (GND, 3,3 V, Daten; externer Pull-up 4,7 kOhm gegen 3,3 V empfohlen).
+# Adressen am Tisch zugeordnet am 31.10.2026 (Fuehler warm gemacht, Reaktion in HA abgelesen).
+# Namen mit "Fuehler" vorn, damit sie sich nicht mit den Werten der Heizung ("Vorlauf Heizkreis", "Warmwasser") mischen.
+one_wire:
+  - platform: gpio
+    pin:
+      number: GPIO16
+      mode:
+        input: true
+        pullup: true
+
+globals:
+  - id: sd_ok
+    type: bool
+    initial_value: 'false'
+
+http_request:
+  timeout: 10s
+  verify_ssl: false
+
+interval:
+  # ===== aus Paket kessel =====
+  # Bus-Waechter: kommt N Minuten kein einziger Frame, Neustart (Bus-off-Falle).
+  - interval: 60s
+    then:
+      - lambda: |-
+          float m = id(waechter_min).state;
+          if (isnan(m) || m <= 0) return;
+          uint32_t grenze = (uint32_t) (m * 60000.0f);
+          uint32_t jetzt = millis();
+          if (jetzt > grenze && id(wcan)->bus.still(jetzt) > grenze) {
+            ESP_LOGW("waechter", "%.0f min kein CAN-Frame - Neustart", m);
+            App.safe_reboot();
+          }
+  # Kessel, alle 40 s
+  - interval: 40s
+    then:
+      - if:
+          condition:
+            lambda: 'return id(can_anfragen).state && id(wcan)->bus.senden_erlaubt(millis());'
+          then:
+            - canbus.send: { canbus_id: my_can_bus, can_id: 0x602, data: !lambda 'return reg::lese(reg::KESSEL_TEMP);' }  # Kesseltemperatur
+            - delay: 150ms
+            - canbus.send: { canbus_id: my_can_bus, can_id: 0x602, data: !lambda 'return reg::lese(reg::ABGAS);' }  # Abgastemperatur
+            - delay: 150ms
+            - canbus.send: { canbus_id: my_can_bus, can_id: 0x602, data: !lambda 'return reg::lese(reg::VORLAUF);' }  # Vorlauf
+            - delay: 150ms
+            - canbus.send: { canbus_id: my_can_bus, can_id: 0x602, data: !lambda 'return reg::lese(reg::LEISTUNG);' }  # Leistung
+            - delay: 150ms
+            - canbus.send: { canbus_id: my_can_bus, can_id: 0x602, data: !lambda 'return reg::lese(reg::DREHZAHL);' }  # Drehzahl
+            - delay: 150ms
+            - canbus.send: { canbus_id: my_can_bus, can_id: 0x602, data: !lambda 'return reg::lese(reg::BRENNER);' }  # Brenner
+  # Kessel und WEM, alle 60 s
+  - interval: 60s
+    then:
+      - if:
+          condition:
+            lambda: 'return id(can_anfragen).state && id(wcan)->bus.senden_erlaubt(millis());'
+          then:
+            - delay: 7s
+            - canbus.send: { canbus_id: my_can_bus, can_id: 0x602, data: !lambda 'return reg::lese(reg::VORLAUF_SOLL);' }  # Vorlauf Soll
+            - delay: 150ms
+            - canbus.send: { canbus_id: my_can_bus, can_id: 0x602, data: !lambda 'return reg::lese(reg::VOLUMENSTROM);' }  # Volumenstrom
+            - delay: 150ms
+            - canbus.send: { canbus_id: my_can_bus, can_id: 0x602, data: !lambda 'return reg::lese(reg::DRUCK);' }  # Anlagendruck
+            - delay: 150ms
+            - canbus.send: { canbus_id: my_can_bus, can_id: 0x601, data: !lambda 'return reg::lese(reg::HK_VORLAUF);' }  # Vorlauf Heizkreis
+            - delay: 150ms
+            - canbus.send: { canbus_id: my_can_bus, can_id: 0x601, data: !lambda 'return reg::lese(reg::VL_SOLL_ANF);' }  # Vorlaufsoll-Anforderung
+  # WEM, alle 5 min: Raumsoll (wechselt mit dem Zeitprogramm)
+  - interval: 300s
+    then:
+      - if:
+          condition:
+            lambda: 'return id(can_anfragen).state && id(wcan)->bus.senden_erlaubt(millis());'
+          then:
+            - delay: 13s
+            - canbus.send: { canbus_id: my_can_bus, can_id: 0x601, data: !lambda 'return reg::lese(reg::RAUMSOLL);' }  # Raumsoll aktuell
+
+  # Betriebsarten (liegen im WEM) werden NICHT periodisch gelesen, sondern nur bei Anlass,
+  # unabhaengig vom Schalter "Eigene CAN-Anfragen":
+  #   - einmal, wenn die Anlaufpause vorbei ist (Board-Start, Bus wieder da)
+  #   - wenn sich die Statusbits aendern (PDO 0x1C1, z.B. Umstellung am Display/Portal)
+  #   - nach einem eigenen Schaltbefehl (das Schalten-Paket liest dann gezielt nach)
+  #   - auf Wunsch: Knopf "Status lesen" bzw. MQTT ${geraet}/cmd/status (Skript status_lesen,
+  #     hebt die 2-min-Grenze fuer diese eine Lesung auf, nimmt Wuensche hoechstens alle 10 s an)
+  # Anlass = Zeitpunkt; gelesen wird 5 s danach, hoechstens alle 2 min (wc::Anlass in kern.h).
+  # Das Warmwasser-Paket haengt sich mit eigener Merkvariable an denselben Anlass.
+  - interval: 5s
+    then:
+      - lambda: |-
+          uint32_t jetzt = millis();
+          id(wcan)->anlass.hk_takt(id(wcan)->bus.senden_erlaubt(jetzt), jetzt);
+      - if:
+          condition:
+            lambda: 'return id(wcan)->anlass.hk_jetzt;'
+          then:
+            - canbus.send: { canbus_id: my_can_bus, can_id: 0x601, data: !lambda 'return reg::lese(reg::HK_BETRIEBSART);' }  # Heizkreis-Betriebsart
+            # Statusbits nach einem Neustart einmal lesen (sonst erst bei der naechsten Aenderung per PDO 0x1C1)
+            - if:
+                condition:
+                  lambda: 'return bf::status().hk_bits < 0;'
+                then:
+                  - delay: 150ms
+                  - canbus.send: { canbus_id: my_can_bus, can_id: 0x601, data: !lambda 'return reg::lese(reg::STATUSBITS);' }
+  # ===== aus Paket warmwasser =====
+  # Paket WARMWASSER: Werte des Warmwasser-Moduls (WW0 im Systemgeraet, Knoten 1)
+  # und der Warmwasserbetrieb des Kessels. Nur lesen. Braucht das Paket kessel.
+  #   JSON MI03 entspricht auf dem Bus Knoten 1, Index JSON-OX + 0x500.
+  # Warmwasser-Betriebsart und -Sollwerte liegen im WEM: gelesen nur bei Anlass (siehe
+  # Paket kessel: nach Start, bei geaenderten Statusbits, nach Schaltbefehlen).
+  - interval: 5s
+    then:
+      - lambda: |-
+          uint32_t jetzt = millis();
+          id(wcan)->anlass.ww_takt(id(wcan)->bus.tot(jetzt), jetzt);
+      - if:
+          condition:
+            lambda: 'return id(wcan)->anlass.ww_jetzt;'
+          then:
+            - canbus.send: { canbus_id: my_can_bus, can_id: 0x601, data: !lambda 'return reg::lese(reg::WW_BETRIEBSART);' }
+            - delay: 150ms
+            - canbus.send: { canbus_id: my_can_bus, can_id: 0x601, data: !lambda 'return reg::lese(reg::WW_SOLL_AKT);' }
+            - delay: 150ms
+            - canbus.send: { canbus_id: my_can_bus, can_id: 0x601, data: !lambda 'return reg::lese(reg::WW_SOLL_NORMAL);' }
+  # ===== aus Paket wem-schalten =====
+  - interval: 1s
+    then:
+      - script.execute: befehl_pruefen
+  # ===== aus Paket kraiz-per-can =====
+  # reihum die naechste faellige Anfrage, hoechstens eine alle 3 s
+  - interval: 3s
+    then:
+      - if:
+          condition:
+            lambda: 'return id(can_anfragen).state && id(wcan)->bus.senden_erlaubt(millis());'
+          then:
+            - lambda: |-
+                uint8_t kn = 0; std::vector<uint8_t> d;
+                if (kc::naechste(millis(), kn, d)) id(wcan)->senden(0x600 + kn, d);
+  # Fehlerblock des WEM (8 Byte, Teilstuecke ueber die Lese-Engine des Repos)
+  - interval: 120s
+    then:
+      - if:
+          condition:
+            lambda: 'return id(can_anfragen).state && id(wcan)->bus.senden_erlaubt(millis());'
+          then:
+            - script.execute: kc_fehler_lesen
+
+script:
+  # ===== aus Paket kessel =====
+  # Status auf Wunsch: Heizkreis-Betriebsart (0x2933/2) und - mit Paket warmwasser -
+  # Warmwasser-Betriebsart und -Sollwerte einmal vom Bus lesen. Nutzt das Anlass-Nachlesen
+  # (interval 5s), schickt also nur LESE-Anfragen an Knoten 1, nie etwas an den WEM per JSON.
+  - id: status_lesen
+    mode: single
+    then:
+      - lambda: |-
+          std::string z = id(wcan)->zeit("%H:%M:%S ");
+          // 2-min-Grenze fuer diese Lesung aufheben, naechster 5-s-Takt liest sofort
+          switch (id(wcan)->anlass.anfordern(id(wcan)->bus, millis())) {
+            case wc::Anlass::Status::SCHWEIGT: id(status_gelesen).publish_state(z + "Bus schweigt - nicht gelesen"); break;
+            case wc::Anlass::Status::VERWORFEN: ESP_LOGI("status", "Status-Anforderung verworfen (hoechstens alle 10 s)"); break;
+            case wc::Anlass::Status::PAUSE: id(status_gelesen).publish_state(z + "angefordert - Anlaufpause, liest danach"); break;
+            case wc::Anlass::Status::ANGEFORDERT: id(status_gelesen).publish_state(z + "angefordert ..."); break;
+          }
+  # ===== aus Paket wem-schalten =====
+  # Schaltwunsch annehmen: ziel 1 Heizkreis, 2 Warmwasser; nutzlast Klartext oder JSON (befehle.h).
+  # Nur Buchfuehrung - gesendet wird erst von befehl_pruefen (hoechstens ein Befehl pro Minute).
+  - id: befehl_eingang
+    mode: queued
+    max_runs: 10
+    parameters:
+      ziel: int
+      nutzlast: string
+      quelle: string
+    then:
+      - lambda: |-
+          auto &s = bf::schaltung();
+          s.uhr = id(wcan)->unix_zeit();
+          bf::Anfrage a; a.quelle = quelle;
+          std::string f;
+          const char *zn = ziel == 1 ? "Heizkreis" : "Warmwasser";
+          if (!bf::anfrage_lesen(ziel, nutzlast, a, f)) {
+            s.ablehnen(ziel, a, f);
+            id(schalt_status).publish_state(a.quelle + ": " + zn + " abgelehnt - " + f);
+          } else {
+            int warten = id(wcan)->schalten.warten_s(millis(), id(wem_senden).is_running() || id(can_senden).is_running() ||
+                                                              id(can_frei_senden).is_running() || id(sd_holen).is_running());
+            // ein frueher eingegangener Wunsch fuer das andere Ziel wird zuerst gesendet (Reihenfolge des Eingangs)
+            if (warten == 0 && s.hat_wunsch[ziel == 1 ? 2 : 1]) warten = (int) id(wcan)->schalten.sperre_s();
+            s.annehmen(ziel, a, warten);
+            id(schalt_status).publish_state("vorgemerkt (" + a.quelle + "): " + zn + " " + bf::wert_text(ziel, a.wert) +
+                                            (warten > 0 ? ", wird in " + to_string(warten) + " s gesendet" : ""));
+          }
+      - script.execute: befehl_melden
+
+  # Phasen der Befehle veroeffentlichen (<geraet>/befehl/status, retained) und loggen
+  - id: befehl_melden
+    mode: queued
+    max_runs: 10
+    then:
+      - lambda: |-
+          auto &s = bf::schaltung();
+          for (auto &e : s.ereignisse) {
+            ESP_LOGI("schalten", "Befehl %s (%s %s): %s%s%s", e.id.c_str(), bf::ziel_name(e.ziel),
+                     e.wert ? bf::wert_text(e.ziel, e.wert) : "-", e.phase.c_str(),
+                     e.grund.empty() ? "" : " - ", e.grund.c_str());
+            #ifdef USE_MQTT
+            mqtt::global_mqtt_client->publish("${geraet}/befehl/status", bf::befehl_json(e), 0, true);
+            #endif
+            #ifdef USE_WC_APP
+            ap::befehl_merken(e);   // Verlauf fuer /api/status der App auf dem Board
+            #endif
+          }
+          if (!s.ereignisse.empty()) bf::status().geaendert = true;
+          s.ereignisse.clear();
+
+  # Eintrag ins Schaltprotokoll (neueste zuerst, 10 Eintraege, seit dem letzten Neustart)
+  - id: protokoll_eintrag
+    mode: queued
+    parameters:
+      text: string
+    then:
+      - lambda: |-
+          auto &p = id(wcan)->schalten.protokoll;
+          p.neu(id(wcan)->zeit("%d.%m. %H:%M ") + text);
+          id(schalt_protokoll).publish_state(p.kurz());
+          #ifdef USE_MQTT
+          mqtt::global_mqtt_client->publish("${geraet}/schaltprotokoll", p.lang(), 0, true);
+          #endif
+
+  # Warteschlange abarbeiten: laeuft jede Sekunde, sendet hoechstens einen Befehl pro Minute
+  - id: befehl_pruefen
+    mode: single
+    then:
+      - lambda: |-
+          auto &sc = id(wcan)->schalten;
+          // Anzeige der Warteschlange (nur bei Aenderung veroeffentlichen)
+          if (sc.letzter_befehl != sc.letzter_gesehen) {
+            sc.letzter_gesehen = sc.letzter_befehl;
+            auto t = id(uhr).now();
+            if (t.is_valid()) { t = ESPTime::from_epoch_local(t.timestamp + sc.sperre_s()); sc.frei_ab = t.strftime("%H:%M:%S"); }
+            else sc.frei_ab = "";
+          }
+          bf::status().setze(bf::status().weg_can, (bool) id(can_schalten).state);   // fuer status/json und App
+          auto &s = bf::schaltung();
+          s.uhr = id(wcan)->unix_zeit();
+          std::string w = wc::warteschlange_text(s, (id(wem_senden).is_running() || id(can_senden).is_running() || id(can_frei_senden).is_running() || id(sd_holen).is_running()) || sc.sperrminute(millis()), sc.frei_ab);
+          if (id(warteschlange).state != w) id(warteschlange).publish_state(w);
+          sc.senden = false;
+          if ((id(wem_senden).is_running() || id(can_senden).is_running() || id(can_frei_senden).is_running() || id(sd_holen).is_running())) return;
+          if (sc.sperrminute(millis())) return;
+          if (s.laeuft) {                          // Sicherung: WEM-Aufruf fertig, Befehl aber noch offen
+            if (sc.ziel == 0) s.keine_rueckmeldung();
+            return;
+          }
+          bf::Befehl bb;
+          if (!s.naechster(bb)) return;
+          char b[24];
+          // VG: CM 03, MI MX OX OS VS, Wert - z.B. 0302002533020001 + Wert (register.yaml)
+          if (bb.ziel == 1) reg::json_vg_schreiben(b, sizeof(b), reg::HK_BETRIEBSART_JSON, bb.wert);   // MI02 HZK0 Betriebsart
+          else              reg::json_vg_schreiben(b, sizeof(b), reg::WW_BETRIEBSART_JSON, bb.wert);   // MI03 WW0 Betriebsart
+          sc.ziel = bb.ziel; sc.vg = b;
+          // Abstand zum naechsten Befehl: per CAN kurz, ueber die JSON-Schnittstelle mindestens 1 min
+          sc.beginnen(millis(), (uint32_t) (id(can_schalten).state ? id(abstand_can).state : id(abstand_json).state) * 1000);
+          id(wcan)->anlass.eigener_befehl_ms = sc.letzter_befehl;
+          bf::status().setze(bf::status().frei_ab, s.uhr ? s.uhr + sc.sperre_s() : 0u);
+          sc.senden = true;
+      - script.execute: befehl_melden
+      - if:
+          condition:
+            lambda: 'return id(wcan)->schalten.senden && id(can_schalten).state;'
+          then:
+            - script.execute: can_senden
+          else:
+            - if:
+                condition:
+                  lambda: 'return id(wcan)->schalten.senden;'
+                then:
+                  - script.execute:
+                      id: wem_senden
+                      vg: !lambda 'return id(wcan)->schalten.vg;'
+
+  # Schalten per CAN (ab v35, Schalter, ab Werk aus): Betriebsart per SDO-Download an den WEM
+  # (Knoten 1, 0x2933/2 bzw. 0x2A20/2, 1 Byte). Antwort 0x60 = bestaetigt, 0x80 = abgelehnt.
+  # Danach wie beim JSON-Weg: der Bus entscheidet (Kontroll-Lesung nach 3 s).
+  - id: can_senden
+    mode: single
+    then:
+      - lambda: |-
+          auto &sc = id(wcan)->schalten;
+          const reg::Sdo &o = sc.ziel == 1 ? reg::HK_BETRIEBSART : reg::WW_BETRIEBSART;
+          wc::CanSchreibbefehl c; c.kn = o.knoten; c.idx = o.index; c.sub = o.sub;
+          c.daten = {(uint8_t) bf::schaltung().lauf.wert};
+          sc.pruefen = false; sc.can_fertig = false; sc.can_text.clear();
+          uint32_t cid = 0; std::vector<uint8_t> d;
+          id(wcan)->schreiben.starten(c, cid, d);
+          id(schalt_status).publish_state("sende per CAN an WEM ...");
+          id(wcan)->senden(cid, d);
+      - delay: 1s
+      - lambda: |-
+          auto &sc = id(wcan)->schalten;
+          int ziel = sc.ziel;
+          if (ziel != 1 && ziel != 2) return;
+          auto &s = bf::schaltung();
+          s.uhr = id(wcan)->unix_zeit();
+          std::string q = s.lauf.quelle;
+          ESP_LOGI("schalten", "CAN: %s | roh: %s", sc.can_text.c_str(), id(wcan)->schreiben.roh.c_str());
+          if (sc.can_fertig && id(wcan)->schreiben.ok) {
+            s.wem_antwort(bf::Wem::BESTAETIGT, "");
+            id(schalt_status).publish_state("WEM hat per CAN bestaetigt, pruefe am Bus ...");
+          } else if (sc.can_fertig) {
+            s.wem_antwort(bf::Wem::CM05, "CAN: " + sc.can_text);
+            id(schalt_status).publish_state(id(wcan)->zeit("%H:%M ") + "per CAN " + sc.can_text);
+            id(protokoll_eintrag)->execute(std::string(ziel == 1 ? "Heizkreis" : "Warmwasser") + " (" + q + "): per CAN " + sc.can_text);
+            sc.ziel = 0;
+          } else {
+            id(wcan)->schreiben.aktiv = false;
+            s.wem_antwort(bf::Wem::NICHT_ERREICHBAR, "CAN: keine Antwort vom WEM");
+            id(schalt_status).publish_state("keine CAN-Antwort vom WEM, pruefe trotzdem am Bus ...");
+          }
+          id(befehl_melden)->execute();
+      - delay: 2s
+      - script.execute: bus_kontrolle
+      - script.wait: bus_kontrolle
+
+  # Freies CAN-Schreiben (ab v35, Schalter "Experten", ab Werk aus): Eingabefeld oder cmd/can_schreiben.
+  # Nur Knoten 01 (WEM), nur Objekte 2000-5FFF (wc::can_schreib_lesen), Sperrminute wie beim Schalten.
+  - id: can_frei_senden
+    mode: queued
+    max_runs: 5
+    parameters:
+      eingabe: string
+    then:
+      - lambda: |-
+          auto &sc = id(wcan)->schalten;
+          sc.can_frei_gesendet = false;
+          if (!id(can_frei).state) { id(can_antwort).publish_state("gesperrt - Schalter \"Freies CAN-Schreiben\" ist aus"); return; }
+          if (id(wem_senden).is_running() || id(can_senden).is_running() || sc.sperrminute(millis())) {
+            id(can_antwort).publish_state("bitte warten - Abstand zum letzten Befehl"); return;
+          }
+          if (id(wcan)->bus.tot(millis())) { id(can_antwort).publish_state("Bus tot - nicht gesendet"); return; }
+          wc::CanSchreibbefehl c; std::string f;
+          if (!wc::can_schreib_lesen(eingabe, c, f)) { id(can_antwort).publish_state(f); return; }
+          sc.beginnen(millis(), (uint32_t) id(abstand_can).state * 1000); id(wcan)->anlass.eigener_befehl_ms = sc.letzter_befehl;
+          uint32_t u = id(wcan)->unix_zeit();
+          if (u != 0) bf::status().setze(bf::status().frei_ab, u + sc.sperre_s());
+          uint32_t cid = 0; std::vector<uint8_t> d;
+          sc.can_fertig = false; sc.can_text.clear();
+          id(wcan)->schreiben.starten(c, cid, d);
+          id(can_antwort).publish_state("gesendet, warte ...");
+          ESP_LOGW("schreiben", "CAN-Schreibbefehl %s", eingabe.c_str());
+          id(wcan)->senden(cid, d);
+          sc.can_frei_gesendet = true;
+      - if:
+          condition:
+            lambda: 'return id(wcan)->schalten.can_frei_gesendet;'
+          then:
+            - delay: 2s
+            - lambda: |-
+                auto &sc = id(wcan)->schalten;
+                auto &w = id(wcan)->schreiben;
+                sc.can_frei_gesendet = false;
+                std::string t = sc.can_fertig ? sc.can_text : "keine Antwort vom WEM";
+                if (!sc.can_fertig) w.aktiv = false;
+                id(can_antwort).publish_state(t);
+                id(can_roh).publish_state(w.roh);
+                id(protokoll_eintrag)->execute("CAN-Schreibbefehl: " + t);
+                ESP_LOGI("schreiben", "%s | roh: %s", t.c_str(), w.roh.c_str());
+
+  # Datei von der SD-Karte des WEM holen (ab v36): einmal pro Aufruf, Sperrminute wie beim Schalten
+  # (die Weboberflaeche des WEM ist empfindlich - nie im Takt). Inhalt per MQTT an
+  # ${geraet}/sd/<datei> (ab 4 KB in Stuecken <datei>/1, /2 ...), der Anfang in der Weboberflaeche;
+  # systable.csv wird zusaetzlich ausgewertet (Knoten, Firmware, Module).
+  - id: sd_holen
+    mode: single
+    parameters:
+      name: string
+    then:
+      - lambda: |-
+          id(sd_ok) = false;
+          auto &sc = id(wcan)->schalten;
+          if (!id(sd_erlaubt).state) { id(sd_antwort).publish_state("gesperrt - Schalter \"SD-Dateien abrufen\" ist aus"); return; }
+          if (!wc::sd_name_ok(name)) { id(sd_antwort).publish_state("ungueltiger Dateiname (nur Buchstaben, Ziffern, _ . -)"); return; }
+          if (id(wem_senden).is_running() || id(can_senden).is_running() || id(can_frei_senden).is_running() || sc.sperrminute(millis())) {
+            id(sd_antwort).publish_state("bitte warten - Abstand zum letzten WEM-Zugriff"); return;
+          }
+          sc.beginnen(millis(), (uint32_t) id(abstand_json).state * 1000);   // HTTP an den WEM wie JSON
+          uint32_t u = id(wcan)->unix_zeit();
+          if (u != 0) bf::status().setze(bf::status().frei_ab, u + sc.sperre_s());
+          id(sd_antwort).publish_state("hole " + name + " ...");
+          id(sd_ok) = true;
+      - if:
+          condition:
+            lambda: 'return id(sd_ok);'
+          then:
+            - http_request.get:
+                url: !lambda 'return "http://" + id(wem_ip).state + "/sd/" + name;'
+                request_headers:
+                  Authorization: !lambda |-
+                    static std::string h;
+                    std::string up = id(wem_user).state + ":" + id(wem_pass).state;
+                    h = "Basic " + esphome::base64_encode((const uint8_t *) up.data(), up.size());
+                    return h.c_str();
+                capture_response: true
+                max_response_buffer_size: 16384
+                on_response:
+                  then:
+                    - lambda: |-
+                        int code = response->status_code;
+                        std::string t = name + ": HTTP " + to_string(code) + ", " + to_string(body.size()) + " Byte";
+                        if (body.size() >= 16384) t += " (bei 16 KB abgeschnitten)";
+                        #ifdef USE_MQTT
+                        if (code == 200) {
+                          std::string basis = "${geraet}/sd/" + name;
+                          if (body.size() <= 4096) {
+                            mqtt::global_mqtt_client->publish(basis, body, 0, false);
+                          } else {
+                            int n = 0;
+                            for (size_t i = 0; i < body.size(); i += 4096)
+                              mqtt::global_mqtt_client->publish(basis + "/" + to_string(++n), body.substr(i, 4096), 0, false);
+                            t += ", MQTT in " + to_string(n) + " Stuecken";
+                          }
+                        }
+                        #endif
+                        id(sd_antwort).publish_state(t);
+                        id(sd_inhalt).publish_state(code == 200 ? body.substr(0, 1000) : std::string(""));
+                        std::string kl = name;
+                        for (auto &c : kl) c = tolower(c);
+                        if (code == 200 && kl == "systable.csv") id(systabelle).publish_state(wc::systabelle_text(body));
+                        ESP_LOGI("sd", "%s", t.c_str());
+                on_error:
+                  then:
+                    - lambda: 'id(sd_antwort).publish_state(name + ": WEM nicht erreichbar");'
+
+  # Kontrolle am Bus nach einem Schaltbefehl (JSON oder CAN): der Bus entscheidet, nicht die
+  # Antwort (auch nach einer leeren JSON-Antwort wurde schon geschaltet).
+  - id: bus_kontrolle
+    mode: single
+    then:
+      - lambda: |-
+          if (id(wcan)->schalten.ziel != 1 && id(wcan)->schalten.ziel != 2) return;
+          const reg::Sdo &ziel = id(wcan)->schalten.ziel == 1 ? reg::HK_BETRIEBSART : reg::WW_BETRIEBSART;
+          id(wcan)->schalten.pruefen = true;
+          bf::status().anlass("schaltbefehl", id(wcan)->schalten.ziel == 1, id(wcan)->schalten.ziel == 2);
+          std::vector<uint8_t> d = reg::lese(ziel);
+          id(wcan)->senden(reg::anfrage_id(ziel), d);
+      - delay: 10s
+      - lambda: |-
+          if (id(wcan)->schalten.ziel != 1 && id(wcan)->schalten.ziel != 2) return;
+          auto &s = bf::schaltung();
+          s.uhr = id(wcan)->unix_zeit();
+          std::string q = s.lauf.quelle;
+          s.keine_rueckmeldung();
+          id(schalt_status).publish_state("keine Rueckmeldung vom Bus - Ergebnis unbekannt");
+          id(protokoll_eintrag)->execute(std::string(id(wcan)->schalten.ziel == 1 ? "Heizkreis" : "Warmwasser") + " (" + q + "): keine Rueckmeldung vom Bus");
+          id(wcan)->schalten.ziel = 0; id(wcan)->schalten.pruefen = false;
+          id(befehl_melden)->execute();
+
+  - id: wem_senden
+    mode: single
+    parameters:
+      vg: string
+    then:
+      - lambda: |-
+          id(wcan)->schalten.pruefen = false;
+          if (id(wcan)->schalten.ziel == 1 || id(wcan)->schalten.ziel == 2) id(schalt_status).publish_state("sende an WEM ...");
+      - http_request.post:
+          url: !lambda 'return "http://" + id(wem_ip).state + "/ajax/CanApiJson.json";'
+          request_headers:
+            Authorization: !lambda |-
+              static std::string h;
+              std::string up = id(wem_user).state + ":" + id(wem_pass).state;
+              h = "Basic " + esphome::base64_encode((const uint8_t *) up.data(), up.size());
+              return h.c_str();
+            Referer: !lambda |-
+              static std::string r;
+              r = "http://" + id(wem_ip).state + "/";
+              return r.c_str();
+            Content-Type: "application/json"
+          body: !lambda 'return wc::wem_rumpf(millis(), vg);'
+          capture_response: true
+          max_response_buffer_size: 512
+          on_response:
+            then:
+              - lambda: |-
+                  std::string rvg = wc::wem_vg(body);
+                  std::string cm = rvg.size() >= 2 ? rvg.substr(0, 2) : std::string("--");
+                  bool ok = response->status_code == 200 && (cm == "04" || cm == "02");
+                  std::string zeit = id(wcan)->zeit("%H:%M ");
+                  int ziel = id(wcan)->schalten.ziel;
+                  if (ziel == 3) {
+                    std::string t = cm == "04" ? "OK, WEM bestaetigt (VG " + rvg + ")" :
+                                    cm == "05" ? "abgelehnt (CM=05): Objekt unbekannt oder nicht schreibbar - VG " + rvg :
+                                    "unklare Antwort, HTTP " + to_string(response->status_code) + (rvg.empty() ? "" : ", VG " + rvg);
+                    id(schreib_antwort).publish_state(t);
+                    id(protokoll_eintrag)->execute("Schreibbefehl " + id(wcan)->schalten.vg + ": " + t);
+                    id(wcan)->schalten.ziel = 0;
+                  } else if (ziel == 1 || ziel == 2) {
+                    auto &s = bf::schaltung();
+                    s.uhr = id(wcan)->unix_zeit();
+                    std::string q = s.lauf.quelle;
+                    if (cm == "05") {
+                      s.wem_antwort(bf::Wem::CM05, "VG " + rvg);
+                      id(schalt_status).publish_state(zeit + "abgelehnt (CM=05) - VG " + rvg);
+                      id(protokoll_eintrag)->execute(std::string(ziel == 1 ? "Heizkreis" : "Warmwasser") + " (" + q + "): abgelehnt, CM=05");
+                      id(wcan)->schalten.ziel = 0;
+                    } else {
+                      s.wem_antwort(ok ? bf::Wem::BESTAETIGT : bf::Wem::UNKLAR,
+                                    ok ? std::string("") : "HTTP " + to_string(response->status_code) + (rvg.empty() ? "" : ", VG " + rvg));
+                      id(schalt_status).publish_state(ok ? "WEM hat bestaetigt, pruefe am Bus ..." :
+                                                           "WEM-Antwort unklar (HTTP " + to_string(response->status_code) + "), pruefe am Bus ...");
+                    }
+                    id(befehl_melden)->execute();
+                  }
+          on_error:
+            then:
+              - lambda: |-
+                  std::string zeit = id(wcan)->zeit("%H:%M ");
+                  int ziel = id(wcan)->schalten.ziel;
+                  if (ziel == 3) {
+                    id(schreib_antwort).publish_state("WEM nicht erreichbar");
+                    id(protokoll_eintrag)->execute("Schreibbefehl " + id(wcan)->schalten.vg + ": WEM nicht erreichbar");
+                    id(wcan)->schalten.ziel = 0;
+                  } else if (ziel == 1 || ziel == 2) {
+                    auto &s = bf::schaltung();
+                    s.uhr = id(wcan)->unix_zeit();
+                    s.wem_antwort(bf::Wem::NICHT_ERREICHBAR, "WEM nicht erreichbar");
+                    id(schalt_status).publish_state("WEM nicht erreichbar, pruefe trotzdem am Bus ...");
+                    id(befehl_melden)->execute();
+                  }
+      # Der Bus entscheidet, nicht die WEM-Antwort: nach 3 s das Zielobjekt am Bus lesen.
+      - delay: 3s
+      - script.execute: bus_kontrolle
+      - script.wait: bus_kontrolle
+  # ===== aus Paket kraiz-per-can =====
+  - id: kc_fehler_lesen
+    mode: single
+    then:
+      - lambda: |-
+          kc::fehler_wartet = false;
+          if (id(wcan)->lesen.aktiv) return;      // ein Lesebefehl von Hand laeuft
+          std::string m; uint32_t cid = 0; std::vector<uint8_t> d;
+          if (id(wcan)->lesen.starten("01 273F 00", id(wcan)->bus.tot(millis()), m, cid, d)) {
+            id(wcan)->senden(cid, d);
+            kc::fehler_wartet = true;
+          }
+      - if:
+          condition:
+            lambda: 'return kc::fehler_wartet;'
+          then:
+            - delay: 3s
+            - lambda: |-
+                auto &l = id(wcan)->lesen;
+                kc::fehler_wartet = false;
+                if (l.aktiv || l.kn != 1 || l.idx != 0x273F || l.puffer.size() < 8) return;
+                const std::vector<uint8_t> &p = l.puffer;
+                id(kc_fehlerblock).publish_state(kc::hex(p));
+                id(kc_fehler_status).publish_state(kc::fehler_text((p[2] << 8) | p[3]));
+                id(kc_fehlernummer).publish_state((p[4] << 8) | p[5]);
+                id(kc_fehler_modul).publish_state((p[6] << 8) | p[7]);
+                id(kc_fehler_klartext).publish_state(kc::klartext((p[2] << 8) | p[3], (p[4] << 8) | p[5]));
+
+  # Schreiben an den WEM per CAN (Knoten 1, 1 Byte) - nur die hier freigegebenen Ziele, Ablauf wie "Freies CAN-Schreiben"
+  - id: kc_schreiben
+    mode: queued
+    max_runs: 3
+    parameters:
+      idx: int
+      sub: int
+      wert: int
+      was: string
+    then:
+      - lambda: |-
+          kc::schreiben_gesendet = false;
+          auto &sc = id(wcan)->schalten;
+          if (id(wem_senden).is_running() || id(can_senden).is_running() || id(can_frei_senden).is_running() || id(sd_holen).is_running() || sc.sperrminute(millis())) {
+            id(schalt_status).publish_state(was + ": bitte warten - Abstand zum letzten Befehl"); return;
+          }
+          if (id(wcan)->bus.tot(millis())) { id(schalt_status).publish_state(was + ": Bus tot - nicht gesendet"); return; }
+          wc::CanSchreibbefehl c; c.kn = 1; c.idx = idx; c.sub = sub; c.daten = {(uint8_t) wert};
+          sc.beginnen(millis(), (uint32_t) id(abstand_can).state * 1000); id(wcan)->anlass.eigener_befehl_ms = sc.letzter_befehl;
+          uint32_t u = id(wcan)->unix_zeit();
+          if (u != 0) bf::status().setze(bf::status().frei_ab, u + sc.sperre_s());
+          uint32_t cid = 0; std::vector<uint8_t> d;
+          sc.can_fertig = false; sc.can_text.clear();
+          id(wcan)->schreiben.starten(c, cid, d);
+          ESP_LOGW("kraiz", "CAN-Schreibbefehl %s: 01 %04X/%02X = %d", was.c_str(), idx, sub, wert);
+          id(wcan)->senden(cid, d);
+          kc::schreiben_gesendet = true;
+      - if:
+          condition:
+            lambda: 'return kc::schreiben_gesendet;'
+          then:
+            - delay: 2s
+            - lambda: |-
+                auto &sc = id(wcan)->schalten;
+                auto &w = id(wcan)->schreiben;
+                kc::schreiben_gesendet = false;
+                std::string t = sc.can_fertig ? sc.can_text : "keine Antwort vom WEM";
+                if (!sc.can_fertig) w.aktiv = false;
+                id(schalt_status).publish_state(was + " per CAN: " + t);
+                id(protokoll_eintrag)->execute(was + " (Web/HA): " + t);
+                ESP_LOGI("kraiz", "%s | roh: %s", t.c_str(), w.roh.c_str());
+                kc::bald(1, idx, sub);        // Zielobjekt in ein paar Sekunden zur Kontrolle neu lesen
+
+button:
+  # ===== aus Paket kessel =====
+  - platform: template
+    name: "Status lesen"               # Betriebsarten einmal vom Bus lesen (nur Leseanfragen)
+    web_server: { sorting_group_id: g_betrieb, sorting_weight: 11 }
+    on_press:
+      - script.execute: status_lesen
+  - platform: restart
+    name: "Neustart ESP"
+    web_server: { sorting_group_id: g_diag, sorting_weight: 10 }
+  - platform: template
+    name: "Lesen"
+    web_server: { sorting_group_id: g_lesen, sorting_weight: 2 }
+    on_press:
+      - lambda: |-
+          std::string m; uint32_t cid = 0; std::vector<uint8_t> d;
+          bool senden = id(wcan)->lesen.starten(id(lese_eingabe).state, id(wcan)->bus.tot(millis()), m, cid, d);
+          id(lese_antwort).publish_state(m);
+          if (senden) id(wcan)->senden(cid, d);
+  # (WLAN-Wechsel-Knopf entfaellt: Olimex-Variante laeuft per LAN)
+  # ===== aus Paket wem-schalten =====
+  - platform: template
+    name: "Schreiben"
+    web_server: { sorting_group_id: g_schreiben, sorting_weight: 2 }
+    on_press:
+      - lambda: |-
+          auto &sc = id(wcan)->schalten;
+          sc.senden = false;
+          if ((id(wem_senden).is_running() || id(can_senden).is_running() || id(can_frei_senden).is_running() || id(sd_holen).is_running()) || sc.sperrminute(millis())) {
+            id(schreib_antwort).publish_state("bitte warten - Abstand zum letzten Befehl"); return;
+          }
+          // Format: MI MX OX OS WERT (hex), z.B. "03 00 2520 02 02" = Warmwasser Aus.
+          // Nur Systemgeraet (MI 01 SYSTEM0, 02 HZK0, 03 WW0) - nie der Kessel (wc::schreib_vg)
+          std::string vg, fehler;
+          if (!wc::schreib_vg(id(schreib_eingabe).state, vg, fehler)) { id(schreib_antwort).publish_state(fehler); return; }
+          sc.vg = vg; sc.ziel = 3;
+          sc.beginnen(millis(), (uint32_t) id(abstand_json).state * 1000); id(wcan)->anlass.eigener_befehl_ms = sc.letzter_befehl; sc.senden = true;
+          uint32_t u = id(wcan)->unix_zeit();
+          if (u != 0) bf::status().setze(bf::status().frei_ab, u + sc.sperre_s());
+          id(schreib_antwort).publish_state("sende VG " + vg + " ...");
+      - if:
+          condition:
+            lambda: 'return id(wcan)->schalten.senden;'
+          then:
+            - script.execute:
+                id: wem_senden
+                vg: !lambda 'return id(wcan)->schalten.vg;'
+  - platform: template
+    name: "CAN schreiben"
+    web_server: { sorting_group_id: g_can_schreiben, sorting_weight: 4 }
+    on_press:
+      - script.execute:
+          id: can_frei_senden
+          eingabe: !lambda 'return id(can_eingabe).state;'
+  - platform: template
+    name: "SD-Datei holen"
+    web_server: { sorting_group_id: g_sd, sorting_weight: 3 }
+    on_press:
+      - script.execute:
+          id: sd_holen
+          name: !lambda 'return id(sd_eingabe).state;'
+  - platform: template
+    name: "Warteschlange leeren"
+    web_server: { sorting_group_id: g_schalten, sorting_weight: 5 }
+    on_press:
+      - lambda: |-
+          auto &s = bf::schaltung();
+          s.uhr = id(wcan)->unix_zeit();
+          if (s.leeren() == 0) return;
+          id(schalt_status).publish_state("Warteschlange geleert");
+          id(protokoll_eintrag)->execute(std::string("Warteschlange von Hand geleert"));
+      - script.execute: befehl_melden
+  # ===== aus Paket kraiz-per-can =====
+  - platform: template
+    name: "Warmwasser-Push"
+    id: kc_ww_push
+    icon: mdi:water-boiler-alert
+    web_server: { sorting_group_id: g_schalten, sorting_weight: 3 }
+    on_press:
+      - script.execute:
+          id: kc_schreiben
+          idx: 0x2A49
+          sub: 2
+          wert: 1
+          was: "Warmwasser-Push"
+
+switch:
+  # ===== aus Paket kessel =====
+  # Eigene CAN-Anfragen: AUS = das Board hoert nur mit und wertet aus, was ohnehin auf dem
+  # Bus liegt (Kessel-PDOs, Antworten auf Fragen des WEM). Schalten ueber den WEM bleibt
+  # erlaubt, samt der einen Kontroll-Leseanfrage danach; ebenso der Lesebefehl von Hand.
+  - platform: template
+    name: "Eigene CAN-Anfragen"
+    id: can_anfragen
+    optimistic: true
+    restore_mode: ${can_anfragen_start}
+    web_server: { sorting_group_id: g_einst, sorting_weight: 5 }
+    # Beim Abschalten: alles, was nur durch eigene Abfragen aktuell blieb, auf "unbekannt".
+    # Fragt der WEM einen Wert selbst ab, fuellt das Mithoeren ihn sofort wieder.
+    on_turn_off:
+      - lambda: |-
+          for (auto *s : {id(wem_kessel), id(wem_abgas), id(wem_vorlauf), id(wem_leistung), id(wem_drehzahl),
+                          id(wem_brenner), id(wem_brennerphase), id(wem_vorlauf_soll), id(wem_volumenstrom), id(wem_druck),
+                          id(hk_vorlauf), id(wem_ww_vlsoll), id(hk_raumsoll_akt)})
+            s->publish_state(NAN);
+          id(wem_brenner_text).publish_state("unbekannt");
+          id(wcan)->brenner.vorher = -1;
+  # Lange Lesedialoge (Teilstuecke/Block) auch am Kessel. Ab Werk AN. Dort teilt sich das Board den
+  # SDO-Kanal 0x602 mit dem WEM, der den Kessel selbst ~3x pro Sekunde abfragt - aus = nur kurze Werte.
+  - platform: template
+    name: "Lange Lesebefehle auch am Kessel"
+    id: lang_am_kessel
+    restore_mode: RESTORE_DEFAULT_ON
+    lambda: 'return id(wcan)->lesen.lang_am_kessel;'
+    turn_on_action:
+      - lambda: 'id(wcan)->lesen.lang_am_kessel = true;'
+    turn_off_action:
+      - lambda: 'id(wcan)->lesen.lang_am_kessel = false;'
+    web_server: { sorting_group_id: g_lesen, sorting_weight: 5 }
+  # ===== aus Paket warmwasser =====
+  - id: !extend can_anfragen
+    on_turn_off:
+      - lambda: |-
+          // Betriebsart und Sollwerte werden bei Anlass gelesen und bleiben deshalb gueltig
+          (void) 0;
+  # ===== aus Paket wem-schalten =====
+  - platform: template
+    name: "Schalten per CAN statt JSON (Heizkreis, Warmwasser)"
+    id: can_schalten
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON    # ab v42 Empfehlung: CAN ist der Hauptweg (Rueckweg: aus = JSON)
+    web_server: { sorting_group_id: g_can_schreiben, sorting_weight: 1 }
+  - platform: template
+    name: "Freies CAN-Schreiben (Experten)"
+    id: can_frei
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    web_server: { sorting_group_id: g_can_schreiben, sorting_weight: 2 }
+  - platform: template
+    name: "SD-Dateien abrufen"
+    id: sd_erlaubt
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    web_server: { sorting_group_id: g_sd, sorting_weight: 1 }
+
+number:
+  # ===== aus Paket kessel =====
+  - platform: template
+    name: "Waechter: Neustart nach Minuten ohne Bus (0 = aus)"
+    id: waechter_min
+    optimistic: true
+    restore_value: true
+    initial_value: 5
+    min_value: 0
+    max_value: 120
+    step: 1
+    mode: box
+    web_server: { sorting_group_id: g_einst, sorting_weight: 10 }
+  # ===== aus Paket wem-schalten =====
+  # Abstand zwischen zwei Befehlen an den WEM (ab v38). Ueber die JSON-Schnittstelle mindestens 60 s
+  # (sie verklemmt sonst); per CAN nimmt der WEM sofort an - der Abstand schont nur sein EEPROM.
+  - platform: template
+    id: abstand_can
+    name: "Abstand zwischen Befehlen per CAN (s)"
+    min_value: 5
+    max_value: 300
+    step: 1
+    initial_value: 10
+    restore_value: true
+    optimistic: true
+    mode: box
+    entity_category: config
+    web_server: { sorting_group_id: g_can_schreiben, sorting_weight: 3 }
+  - platform: template
+    id: abstand_json
+    name: "Abstand zwischen Befehlen per JSON (s)"
+    min_value: 60
+    max_value: 600
+    step: 1
+    initial_value: 60
+    restore_value: true
+    optimistic: true
+    mode: box
+    entity_category: config
+    web_server: { sorting_group_id: g_schalten, sorting_weight: 9 }
+
+select:
+  # ===== aus Paket wem-schalten =====
+  - platform: template
+    name: "Heizkreis Betriebsart setzen"
+    id: hk_setzen
+    options: ["Standby", "Zeitprogramm 1", "Zeitprogramm 2", "Zeitprogramm 3", "Sommer", "Komfort", "Normal", "Absenk"]
+    optimistic: false
+    web_server: { sorting_group_id: g_schalten, sorting_weight: 1 }
+    set_action:
+      - script.execute:
+          id: befehl_eingang
+          ziel: 1
+          nutzlast: !lambda 'return x;'
+          quelle: "Web/HA"
+      - script.execute: befehl_pruefen
+  # ===== aus Paket warmwasser-schalten =====
+  - platform: template
+    name: "Warmwasser setzen"
+    id: ww_setzen
+    options: ["Ein", "Aus"]
+    optimistic: false
+    web_server: { sorting_group_id: g_schalten, sorting_weight: 2 }
+    set_action:
+      - script.execute:
+          id: befehl_eingang
+          ziel: 2
+          nutzlast: !lambda 'return x;'
+          quelle: "Web/HA"
+      - script.execute: befehl_pruefen
+
+text:
+  # ===== aus Paket kessel =====
+  # Lesebefehl "KNOTEN INDEX SUB" hex, z.B. "01 2933 02". NUR LESEN (0x40; lange Objekte in Teilstuecken, sonst Block 0xA4).
+  - platform: template
+    name: "Lesebefehl (KN IDX SUB hex)"
+    id: lese_eingabe
+    optimistic: true
+    mode: text
+    max_length: 24
+    web_server: { sorting_group_id: g_lesen, sorting_weight: 1 }
+  # ===== aus Paket wem-schalten =====
+  - platform: template
+    name: "Heizung: IP-Adresse"
+    id: wem_ip
+    optimistic: true
+    restore_value: true
+    initial_value: !secret wem_ip
+    mode: text
+    max_length: 40
+    web_server: { sorting_group_id: g_einst, sorting_weight: 1 }
+  - platform: template
+    name: "WEM-Benutzer"
+    id: wem_user
+    optimistic: true
+    internal: true           # Weishaupt ab Werk, laut Anleitung nicht aenderbar
+    initial_value: !secret wem_user
+    mode: text
+    max_length: 32
+  - platform: template
+    name: "WEM-Passwort"
+    id: wem_pass
+    optimistic: true
+    internal: true
+    initial_value: !secret wem_pass
+    mode: password
+    max_length: 32
+  - platform: template
+    name: "SD-Datei (Name auf der SD-Karte des WEM)"
+    id: sd_eingabe
+    optimistic: true
+    mode: text
+    max_length: 40
+    initial_value: "systable.csv"
+    web_server: { sorting_group_id: g_sd, sorting_weight: 2 }
+  - platform: template
+    name: "CAN-Schreibbefehl (KN IDX SUB WERT [LAENGE] hex)"
+    id: can_eingabe
+    optimistic: true
+    mode: text
+    max_length: 255
+    web_server: { sorting_group_id: g_can_schreiben, sorting_weight: 3 }
+  - platform: template
+    name: "Schreibbefehl (MI MX OX OS WERT hex)"
+    id: schreib_eingabe
+    optimistic: true
+    mode: text
+    max_length: 32
+    web_server: { sorting_group_id: g_schreiben, sorting_weight: 1 }
+
+text_sensor:
+  # ===== aus Paket kessel =====
+  - platform: template
+    name: "Kesselstatus"
+    id: wem_kesselstatus
+    web_server: { sorting_group_id: g_kessel, sorting_weight: 1 }
+  - platform: template
+    name: "Uhrzeit Heizung"          # aus PDO 0x181 - geht die Heizungsuhr falsch, laufen Zeitprogramme falsch
+    id: heizung_uhr
+    web_server: { sorting_group_id: g_diag, sorting_weight: 13 }
+  - platform: template
+    name: "Brenner Status"
+    id: wem_brenner_text
+    web_server: { sorting_group_id: g_kessel, sorting_weight: 2 }
+  - platform: template
+    name: "Systembetriebsart"
+    id: wem_systembetriebsart
+    web_server: { sorting_group_id: g_betrieb, sorting_weight: 1 }
+  - platform: template
+    name: "Heizkreis Betriebsart"
+    id: hk_betriebsart
+    web_server: { sorting_group_id: g_betrieb, sorting_weight: 2 }
+  - platform: template
+    name: "Heizkreis Status"
+    id: wem_betriebsart_hk
+    web_server: { sorting_group_id: g_betrieb, sorting_weight: 3 }
+  - platform: template
+    name: "Status gelesen"             # Zeitpunkt der letzten Lesung der Betriebsarten
+    id: status_gelesen
+    web_server: { sorting_group_id: g_betrieb, sorting_weight: 12 }
+  - platform: template
+    name: "Lesebefehl Antwort"
+    id: lese_antwort
+    web_server: { sorting_group_id: g_lesen, sorting_weight: 3 }
+  - platform: template
+    name: "Lesebefehl Rohdaten"        # jede Nachricht des letzten Lesebefehls: > gesendet, < empfangen
+    id: lese_roh
+    web_server: { sorting_group_id: g_lesen, sorting_weight: 4 }
+  - platform: template
+    name: "Eigene CAN-Anfragen"
+    update_interval: 30s
+    web_server: { sorting_group_id: g_diag, sorting_weight: 4 }
+    lambda: 'return {wc::anfragen_text(id(can_anfragen).state, id(wcan)->bus, millis())};'
+  - platform: template
+    name: "Firmware"
+    id: fw_stand
+    lambda: 'return {"${firmware}"};'
+    update_interval: 3600s
+    web_server: { sorting_group_id: g_fw, sorting_weight: 1 }
+  - platform: version
+    name: "ESPHome-Version"
+    hide_timestamp: false
+    web_server: { sorting_group_id: g_fw, sorting_weight: 2 }
+  - platform: ethernet_info
+    ip_address:
+      name: "IP-Adresse"
+      web_server: { sorting_group_id: g_diag, sorting_weight: 5 }
+    dns_address:
+      name: "DNS-Server"
+      web_server: { sorting_group_id: g_diag, sorting_weight: 9 }
+    mac_address:
+      name: "MAC-Adresse"
+      web_server: { sorting_group_id: g_diag, sorting_weight: 12 }
+  - platform: template
+    name: "Gateway"
+    update_interval: 60s
+    web_server: { sorting_group_id: g_diag, sorting_weight: 7 }
+    lambda: |-
+      esp_netif_t *n = esp_netif_get_handle_from_ifkey("ETH_DEF");
+      esp_netif_ip_info_t ip;
+      if (n == nullptr || esp_netif_get_ip_info(n, &ip) != ESP_OK) return {"-"};
+      char b[20]; snprintf(b, sizeof(b), IPSTR, IP2STR(&ip.gw));
+      return {b};
+  - platform: template
+    name: "Netzmaske"
+    update_interval: 60s
+    web_server: { sorting_group_id: g_diag, sorting_weight: 8 }
+    lambda: |-
+      esp_netif_t *n = esp_netif_get_handle_from_ifkey("ETH_DEF");
+      esp_netif_ip_info_t ip;
+      if (n == nullptr || esp_netif_get_ip_info(n, &ip) != ESP_OK) return {"-"};
+      char b[20]; snprintf(b, sizeof(b), IPSTR, IP2STR(&ip.netmask));
+      return {b};
+  # ===== aus Paket warmwasser =====
+  - platform: template
+    name: "Warmwasser Betriebsart"
+    id: ww_betriebsart
+    web_server: { sorting_group_id: g_betrieb, sorting_weight: 6 }
+  - platform: template
+    name: "Warmwasser aktiv"          # Ein = Kessel ist im Warmwasserbetrieb
+    id: wem_ww_aktiv
+    web_server: { sorting_group_id: g_betrieb, sorting_weight: 7 }
+  # ===== aus Paket wem-schalten =====
+  - platform: template
+    name: "Ergebnis letzter Schaltbefehl"
+    id: schalt_status
+    web_server: { sorting_group_id: g_schalten, sorting_weight: 4 }
+  - platform: template
+    name: "Warteschlange"
+    id: warteschlange
+    web_server: { sorting_group_id: g_schalten, sorting_weight: 3 }
+  - platform: template
+    name: "Schaltprotokoll"
+    id: schalt_protokoll
+    web_server: { sorting_group_id: g_schalten, sorting_weight: 6 }
+  - platform: template
+    name: "Schreibbefehl Antwort"
+    id: schreib_antwort
+    web_server: { sorting_group_id: g_schreiben, sorting_weight: 3 }
+  - platform: template
+    name: "CAN-Schreibbefehl Antwort"
+    id: can_antwort
+    web_server: { sorting_group_id: g_can_schreiben, sorting_weight: 5 }
+  - platform: template
+    name: "CAN-Schreibbefehl Rohdaten"
+    id: can_roh
+    web_server: { sorting_group_id: g_can_schreiben, sorting_weight: 6 }
+  - platform: template
+    name: "SD-Datei Antwort"
+    id: sd_antwort
+    web_server: { sorting_group_id: g_sd, sorting_weight: 4 }
+  - platform: template
+    name: "SD-Datei Inhalt (Anfang)"
+    id: sd_inhalt
+    web_server: { sorting_group_id: g_sd, sorting_weight: 5 }
+  - platform: template
+    name: "Systemtabelle (Knoten, Module)"
+    id: systabelle
+    web_server: { sorting_group_id: g_sd, sorting_weight: 6 }
+  # ===== aus Paket kraiz-per-can =====
+  - platform: template
+    name: "Betriebsart HK1 aktuell"
+    id: kc_betriebsart_hk1_aktuell
+    web_server: { sorting_group_id: g_kraiz }
+  - platform: template
+    name: "Status HK1"
+    id: kc_status_hk1
+    web_server: { sorting_group_id: g_kraiz }
+  - platform: template
+    name: "So-Wi Umschaltung HK1"
+    id: kc_sowi_umschaltung_hk1
+    web_server: { sorting_group_id: g_kraiz }
+  - platform: template
+    name: "Status Warmwasser"
+    id: kc_status_warmwasser
+    web_server: { sorting_group_id: g_kraiz }
+  - platform: template
+    name: "Warmwasser-Push"
+    id: kc_warmwasser_push
+    web_server: { sorting_group_id: g_kraiz }
+  - platform: template
+    name: "Pumpe Warmwasser"
+    id: kc_pumpe_warmwasser
+    web_server: { sorting_group_id: g_kraiz }
+  - platform: template
+    name: "Folgewechsel"
+    id: kc_folgewechsel
+    disabled_by_default: true
+    web_server: { sorting_group_id: g_kraiz }
+  - platform: template
+    name: "Betriebsphase WTC"
+    id: kc_betriebsphase
+    web_server: { sorting_group_id: g_kraiz }
+  - platform: template
+    name: "Fehler-Warnung Status"
+    id: kc_fehler_status
+    icon: mdi:alert-circle-outline
+    entity_category: diagnostic
+    web_server: { sorting_group_id: g_diag }
+  - platform: template
+    name: "Fehler-Klartext"
+    id: kc_fehler_klartext
+    icon: mdi:alert-circle-check-outline
+    entity_category: diagnostic
+    web_server: { sorting_group_id: g_diag }
+  - platform: template
+    name: "CANopen Fehlerblock"
+    id: kc_fehlerblock
+    icon: mdi:alert-box-outline
+    entity_category: diagnostic
+    disabled_by_default: true
+    web_server: { sorting_group_id: g_diag }
+  - platform: template
+    name: "Letzte Emergency-Meldung"
+    id: kc_emergency
+    icon: mdi:alert-octagon-outline
+    entity_category: diagnostic
+    web_server: { sorting_group_id: g_diag }
+
+sensor:
+  # ===== aus Paket kessel =====
+  # --- Kessel ---
+  - platform: template
+    name: "Kesseltemperatur"
+    id: wem_kessel
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+    update_interval: never
+    web_server: { sorting_group_id: g_kessel, sorting_weight: 4 }
+  - platform: template
+    name: "Vorlauf"                  # 0x2536/00 - existiert, Deutung bei laufendem Brenner noch zu pruefen
+    id: wem_vorlauf
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+    update_interval: never
+    web_server: { sorting_group_id: g_kessel, sorting_weight: 5 }
+  - platform: template
+    name: "Ruecklauf"                # 0x2699 VPT, passiv aus 0x6C2 (am 27.09. 17,9 bei 18,5 Vorlauf)
+    id: wem_ruecklauf
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+    update_interval: never
+    web_server: { sorting_group_id: g_kessel, sorting_weight: 5 }
+  - platform: template
+    name: "Vorlauf VPT"              # 0x2697 VPT, passiv aus 0x6C2
+    id: wem_vorlauf_vpt
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+    update_interval: never
+    web_server: { sorting_group_id: g_kessel, sorting_weight: 5 }
+  - platform: template
+    name: "Sollleistung"             # 0x2698, passiv aus 0x6C2
+    id: wem_sollleistung
+    unit_of_measurement: "%"
+    accuracy_decimals: 2             # Bus liefert 0,01 %
+    update_interval: never
+    web_server: { sorting_group_id: g_kessel, sorting_weight: 8 }
+  - platform: template
+    name: "Vorlauf Soll"
+    id: wem_vorlauf_soll
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+    update_interval: never
+    web_server: { sorting_group_id: g_kessel, sorting_weight: 6 }
+  - platform: template
+    name: "Abgastemperatur"          # Objekt 0x2537 (in manchen Vorlagen faelschlich "Ruecklauf")
+    id: wem_abgas
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+    update_interval: never
+    web_server: { sorting_group_id: g_kessel, sorting_weight: 7 }
+  - platform: template
+    name: "Leistung"
+    id: wem_leistung
+    unit_of_measurement: "%"
+    device_class: power_factor
+    accuracy_decimals: 2             # Bus liefert 0,01 %
+    update_interval: never
+    web_server: { sorting_group_id: g_kessel, sorting_weight: 8 }
+  - platform: template
+    name: "Drehzahl"
+    id: wem_drehzahl
+    unit_of_measurement: "U/min"
+    accuracy_decimals: 0
+    update_interval: never
+    web_server: { sorting_group_id: g_kessel, sorting_weight: 9 }
+  - platform: template
+    name: "Anlagendruck"
+    id: wem_druck
+    unit_of_measurement: "bar"
+    device_class: pressure
+    accuracy_decimals: 2
+    update_interval: never
+    web_server: { sorting_group_id: g_kessel, sorting_weight: 10 }
+  - platform: template
+    name: "Volumenstrom"
+    id: wem_volumenstrom
+    unit_of_measurement: "l/h"
+    accuracy_decimals: 0
+    update_interval: never
+    web_server: { sorting_group_id: g_kessel, sorting_weight: 11 }
+  - platform: template
+    name: "Heizanforderung"
+    id: wem_heizanforderung
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+    update_interval: never
+    web_server: { sorting_group_id: g_kessel, sorting_weight: 12 }
+  - platform: template
+    name: "Aussentemperatur"
+    id: wem_aussentemp
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+    update_interval: never
+    web_server: { sorting_group_id: g_kessel, sorting_weight: 13 }
+  - platform: template
+    name: "Brennerstarts"
+    id: wem_brennerstarts
+    accuracy_decimals: 0
+    state_class: total_increasing
+    update_interval: never
+    web_server: { sorting_group_id: g_kessel, sorting_weight: 3 }
+  # --- Heizkreis ---
+  - platform: template
+    name: "Raumsoll aktuell"
+    id: hk_raumsoll_akt
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+    update_interval: never
+    web_server: { sorting_group_id: g_betrieb, sorting_weight: 4 }
+  - platform: template
+    name: "Vorlauf Heizkreis"
+    id: hk_vorlauf
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+    update_interval: never
+    web_server: { sorting_group_id: g_betrieb, sorting_weight: 5 }
+  - platform: template
+    name: "Vorlaufsoll Anforderung"
+    id: wem_ww_vlsoll
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+    update_interval: never
+    web_server: { sorting_group_id: g_betrieb, sorting_weight: 11 }
+  # --- Energie (Vortageswerte, der Kessel liefert sie nur, wenn der WEM sie abfragt) ---
+  - platform: template
+    name: "Wärmemenge Vortag Heizung"
+    id: wem_wm_heizung
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 2             # Bus liefert 0,01 kWh
+    device_class: energy
+    state_class: total_increasing
+    update_interval: never
+    web_server: { sorting_group_id: g_energie, sorting_weight: 1 }
+  - platform: template
+    name: "Wärmemenge Vortag WW"
+    id: wem_wm_ww
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 2             # Bus liefert 0,01 kWh
+    device_class: energy
+    state_class: total_increasing
+    update_interval: never
+    web_server: { sorting_group_id: g_energie, sorting_weight: 2 }
+  - platform: template
+    name: "Wärmemenge Vortag Gesamt"
+    id: wem_wm_gesamt
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 2             # Bus liefert 0,01 kWh
+    device_class: energy
+    state_class: total_increasing
+    update_interval: never
+    web_server: { sorting_group_id: g_energie, sorting_weight: 3 }
+  # --- Zahlencodes (Text steht jeweils daneben; Zahlen fuer Grafana/InfluxDB) ---
+  - platform: template
+    name: "Brennerphase"             # 0 aus, 1 Vorbelueftung, 2 Steuer-, 3 Regelbetrieb, 4 Nachbelueftung
+    id: wem_brennerphase
+    update_interval: never
+    web_server: { sorting_group_id: g_codes, sorting_weight: 1 }
+  - platform: template
+    name: "Brenner"                  # 1 = Flamme an (Phase 2/3), sonst 0; aus den Flanken rechnet Grafana die Taktung
+    id: wem_brenner
+    update_interval: never
+    web_server: { sorting_group_id: g_codes, sorting_weight: 1 }
+  - platform: template
+    name: "Kesselstatus Code"
+    id: wem_kesselstatus_code
+    update_interval: never
+    web_server: { sorting_group_id: g_codes, sorting_weight: 2 }
+  - platform: template
+    name: "Heizkreis Status Code"
+    id: wem_betriebsart_hk_code
+    update_interval: never
+    web_server: { sorting_group_id: g_codes, sorting_weight: 3 }
+  - platform: template
+    name: "Heizkreis Betriebsart Code"
+    id: hk_betriebsart_code
+    update_interval: never
+    web_server: { sorting_group_id: g_codes, sorting_weight: 4 }
+  - platform: template
+    name: "Systembetriebsart Code"
+    id: wem_systembetriebsart_code
+    update_interval: never
+    web_server: { sorting_group_id: g_codes, sorting_weight: 6 }
+  # --- Diagnose ---
+  - platform: uptime
+    name: "Laufzeit"
+    update_interval: 60s
+    web_server: { sorting_group_id: g_diag, sorting_weight: 3 }
+  - platform: template
+    name: "Letzter CAN-Frame vor"    # Grafana-Warnung, wenn dauerhaft > 300 s
+    unit_of_measurement: "s"
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: 'return id(wcan)->bus.still(millis()) / 1000.0f;'
+    web_server: { sorting_group_id: g_diag, sorting_weight: 4 }
+  # ===== aus Paket warmwasser =====
+  - platform: template
+    name: "Warmwasser"
+    id: wem_warmwasser
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+    update_interval: never
+    web_server: { sorting_group_id: g_betrieb, sorting_weight: 8 }
+  - platform: template
+    name: "Warmwasser Soll aktuell"
+    id: ww_soll_akt
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+    update_interval: never
+    web_server: { sorting_group_id: g_betrieb, sorting_weight: 9 }
+  - platform: template
+    name: "Warmwasser Soll normal"
+    id: ww_soll_normal
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+    update_interval: never
+    web_server: { sorting_group_id: g_betrieb, sorting_weight: 10 }
+  - platform: template
+    name: "Warmwasser aktiv Zahl"
+    id: wem_ww_aktiv_num
+    update_interval: never
+    web_server: { sorting_group_id: g_codes, sorting_weight: 5 }
+  - platform: template
+    name: "Warmwasser Betriebsart Code"
+    id: ww_betriebsart_code
+    update_interval: never
+    web_server: { sorting_group_id: g_codes, sorting_weight: 7 }
+  # ===== aus Paket kraiz-per-can =====
+  - platform: template
+    name: "Raumsolltemperatur Komfort"
+    id: kc_raumsolltemperatur_komfort
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    web_server: { sorting_group_id: g_kraiz }
+  - platform: template
+    name: "Raumsolltemperatur Normal"
+    id: kc_raumsolltemperatur_normal
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    web_server: { sorting_group_id: g_kraiz }
+  - platform: template
+    name: "Raumsolltemperatur Absenk"
+    id: kc_raumsolltemperatur_absenk
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    web_server: { sorting_group_id: g_kraiz }
+  - platform: template
+    name: "Vorlaufsolltemperatur Komfort"
+    id: kc_vorlaufsolltemperatur_komfort
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    web_server: { sorting_group_id: g_kraiz }
+  - platform: template
+    name: "Vorlaufsolltemperatur Normal"
+    id: kc_vorlaufsolltemperatur_normal
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    web_server: { sorting_group_id: g_kraiz }
+  - platform: template
+    name: "Vorlaufsolltemperatur Absenk"
+    id: kc_vorlaufsolltemperatur_absenk
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    web_server: { sorting_group_id: g_kraiz }
+  - platform: template
+    name: "Vorlaufsolltemperatur Sonderniveau"
+    id: kc_vorlaufsolltemperatur_sonderniveau
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    web_server: { sorting_group_id: g_kraiz }
+  - platform: template
+    name: "Vorlaufsolltemperatur aktuell"
+    id: kc_vorlaufsolltemperatur_aktuell
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    web_server: { sorting_group_id: g_kraiz }
+  - platform: template
+    name: "WW-Solltemperatur Absenk"
+    id: kc_wwsolltemperatur_absenk
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    web_server: { sorting_group_id: g_kraiz }
+  - platform: template
+    name: "Wärmeanforderung Warmwasser"
+    id: kc_waermeanforderung_warmwasser
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    web_server: { sorting_group_id: g_kraiz }
+  - platform: template
+    name: "Rücklauftemperatur Zirkulation"
+    id: kc_ruecklauftemperatur_zirkulation
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    disabled_by_default: true
+    web_server: { sorting_group_id: g_kraiz }
+  - platform: template
+    name: "Plattenwärmetauschertemperatur (B2)"
+    id: kc_plattenwaermetauschertemperatur_b2
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    disabled_by_default: true
+    web_server: { sorting_group_id: g_kraiz }
+  - platform: template
+    name: "Pufferspeicher Temperatur oben"
+    id: kc_pufferspeicher_temperatur_oben
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    disabled_by_default: true
+    web_server: { sorting_group_id: g_kraiz }
+  - platform: template
+    name: "Pufferspeicher Temperatur unten"
+    id: kc_pufferspeicher_temperatur_unten
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    disabled_by_default: true
+    web_server: { sorting_group_id: g_kraiz }
+  - platform: template
+    name: "N1-Vorgabe über Ethernet"
+    id: kc_n1_vorgabe_ethernet
+    unit_of_measurement: "%"
+    state_class: measurement
+    accuracy_decimals: 2
+    disabled_by_default: true
+    web_server: { sorting_group_id: g_kraiz }
+  - platform: template
+    name: "Kaskade Sollwert HZ"
+    id: kc_kaskade_sollwert_hz
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    disabled_by_default: true
+    web_server: { sorting_group_id: g_kraiz }
+  - platform: template
+    name: "Kaskade Sollwert WW"
+    id: kc_kaskade_sollwert_ww
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    disabled_by_default: true
+    web_server: { sorting_group_id: g_kraiz }
+  - platform: template
+    name: "Kaskade Soll-Modulation HZ"
+    id: kc_kaskade_sollmodulation_hz
+    unit_of_measurement: "%"
+    state_class: measurement
+    accuracy_decimals: 2
+    disabled_by_default: true
+    web_server: { sorting_group_id: g_kraiz }
+  - platform: template
+    name: "Kaskade Soll-Modulation WW"
+    id: kc_kaskade_sollmodulation_ww
+    unit_of_measurement: "%"
+    state_class: measurement
+    accuracy_decimals: 2
+    disabled_by_default: true
+    web_server: { sorting_group_id: g_kraiz }
+  - platform: template
+    name: "Wechselzeit"
+    id: kc_wechselzeit
+    accuracy_decimals: 0
+    disabled_by_default: true
+    web_server: { sorting_group_id: g_kraiz }
+  - platform: template
+    name: "Kaskade Abgleichtemperatur"
+    id: kc_kaskade_abgleichtemperatur
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    disabled_by_default: true
+    web_server: { sorting_group_id: g_kraiz }
+  - platform: template
+    name: "Fehlernummer"
+    id: kc_fehlernummer
+    icon: mdi:numeric
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    web_server: { sorting_group_id: g_diag }
+  - platform: template
+    name: "Fehlermodul"
+    id: kc_fehler_modul
+    icon: mdi:chip
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    web_server: { sorting_group_id: g_diag }
+  # ===== aus Paket temperaturen =====
+  - platform: dallas_temp
+    address: 0x2f0000000c9e8428
+    name: "Fühler Umgebung"
+    update_interval: 30s
+    web_server: { sorting_group_id: g_dallas, sorting_weight: 1 }
+  - platform: dallas_temp
+    address: 0xd10000000aacc328
+    name: "Fühler Warmwasser Speicher oben"
+    update_interval: 30s
+    web_server: { sorting_group_id: g_dallas, sorting_weight: 2 }
+  - platform: dallas_temp
+    address: 0xa40000000d018028
+    name: "Fühler Vorlauf Heizkreis"
+    update_interval: 30s
+    web_server: { sorting_group_id: g_dallas, sorting_weight: 3 }
+  - platform: dallas_temp
+    address: 0xf40000000a951a28
+    name: "Fühler Rücklauf Heizkreis 1"
+    update_interval: 30s
+    web_server: { sorting_group_id: g_dallas, sorting_weight: 4 }
+  - platform: dallas_temp
+    address: 0x400000000a81c428
+    name: "Fühler Rücklauf Heizkreis 2"
+    update_interval: 30s
+    web_server: { sorting_group_id: g_dallas, sorting_weight: 5 }
+
+canbus:
+  - platform: esp32_can
+    id: my_can_bus
+    can_id: 0x602
+    tx_pin: GPIO5     # Olimex ESP32-EVB (Original WeAct CAN485: GPIO27)
+    rx_pin: GPIO35    # Olimex ESP32-EVB (Original WeAct CAN485: GPIO26)
+    bit_rate: 50kbps
+    on_frame:
+      # jeder Frame: Lebenszeichen des Busses + Antwort auf einen offenen Lesebefehl
+      - can_id: 0x000
+        can_id_mask: 0x000
+        then:
+          - lambda: |-
+              id(wcan)->frame(millis());
+              std::string t;
+              bool fertig = id(wcan)->lesen.antwort(can_id, x, t, millis());
+              id(wcan)->wem_netz.antwort(can_id, x, millis());   // WEM-Adresse per CAN (ab v42)
+              if ((can_id & 0x780) == 0x700 && (can_id & 0x7F) != 0) id(wcan)->knoten_gesehen[can_id & 0x7F] = millis() | 1;
+              // Teilstuecke/Block: naechste Leseanfrage (nach der Pause), Block-Ende quittieren
+              uint32_t fid = 0; std::vector<uint8_t> fd;
+              if (id(wcan)->lesen.weiter(fid, fd, millis())) id(wcan)->senden(fid, fd);
+              // Schreibbefehl per CAN (ab v35, ab Werk aus): Antwort auswerten, naechstes Teilstueck
+              std::string st;
+              if (id(wcan)->schreiben.antwort(can_id, x, st, millis())) {
+                id(wcan)->schalten.can_fertig = true; id(wcan)->schalten.can_text = st;
+              }
+              if (id(wcan)->schreiben.weiter(fid, fd, millis())) id(wcan)->senden(fid, fd);
+              if (fertig) {
+                id(lese_antwort).publish_state(t);
+                id(lese_roh).publish_state(id(wcan)->lesen.roh);
+                ESP_LOGI("lesen", "%s | roh: %s", t.c_str(), id(wcan)->lesen.roh.c_str());
+              }
+
+      # PDO 0x201: Aussentemperatur + Systembetriebsart (Kessel sendet von selbst)
+      - can_id: 0x201
+        then:
+          - lambda: |-
+              id(wem_aussentemp).publish_state(reg::pdo_wert(reg::AUSSENTEMP, x));
+              int sb = x[reg::SYSTEMBETRIEBSART.byte];
+              id(wem_systembetriebsart_code).publish_state((float) sb);
+              id(wem_systembetriebsart).publish_state(wc::system_text(sb));
+
+      # PDO 0x241: Heizanforderung (Bytes 0-1); Bytes 6-7 = Warmwasser (Paket warmwasser)
+      - can_id: 0x241
+        then:
+          - lambda: |-
+              id(wem_heizanforderung).publish_state(reg::pdo_wert(reg::VORLAUFSOLL_HZ, x));
+              // Bytes 2-3: Kesseltemperatur (gleich 0x2532) - kommt so alle paar Sekunden, ohne Anfrage
+              if (x.size() >= 4) id(wem_kessel).publish_state(reg::pdo_wert(reg::KESSEL_TEMP_PDO, x));
+
+      # PDO 0x181: Datum und Uhrzeit der Heizung (Stunde, Minute, Jahr-2000, Monat, Tag, Wochentag)
+      - can_id: 0x181
+        then:
+          - lambda: |-
+              if (x.size() < 6) return;
+              id(heizung_uhr).publish_state(wc::uhr_text(x));
+
+      # SDO-Download an Knoten 0x42 (0x6C2): der Kessel meldet alle ~5 s Werte weiter.
+      # Rein passiv mitgelesen. Objekte laut geronet1/wem-python, Werte an der Anlage plausibel.
+      - can_id: 0x6C2
+        then:
+          - lambda: |-
+              if (x.size() < 6 || (x[0] != 0x2B && x[0] != 0x2F && x[0] != 0x23)) return;
+              uint16_t idx = (x[2] << 8) | x[1];
+              uint8_t sub = x[3];
+              int16_t v = (int16_t)((x[5] << 8) | x[4]);
+              if (sub != 1) return;
+              if (reg::ist(reg::RUECKLAUF_VPT, idx, sub)) id(wem_ruecklauf).publish_state(reg::wert(reg::RUECKLAUF_VPT, v));
+              else if (reg::ist(reg::VORLAUF_VPT, idx, sub)) id(wem_vorlauf_vpt).publish_state(reg::wert(reg::VORLAUF_VPT, v));
+              else if (reg::ist(reg::SOLLLEISTUNG, idx, sub)) id(wem_sollleistung).publish_state(reg::wert(reg::SOLLLEISTUNG, v));
+
+      # PDO 0x182: Kesselstatus (Objekt 0x2530)
+      - can_id: 0x182
+        then:
+          - lambda: |-
+              uint8_t st = x[reg::KESSELSTATUS.byte];
+              id(wem_kesselstatus).publish_state(bf::kessel_text(st));
+              bf::status().setze(bf::status().kesselstatus, (int) st);
+              id(wem_kesselstatus_code).publish_state((float) st);
+
+      # PDO 0x1C1: Statusbits Knoten 1 (Objekt 0x274D) - 0x1000 Heizkreis Standby, 0x0010 WW-Ladung
+      - can_id: 0x1C1
+        then:
+          - lambda: |-
+              uint16_t m = (x[reg::STATUSBITS_PDO.byte + 1] << 8) | x[reg::STATUSBITS_PDO.byte];
+              id(wcan)->anlass.statusbits(m, millis());
+              id(wem_betriebsart_hk).publish_state(wc::hk_status_text(m));
+              id(wem_betriebsart_hk_code).publish_state((float) m);
+
+      # SDO-Antworten Knoten 1 (Systemgeraet)
+      - can_id: 0x581
+        then:
+          - lambda: |-
+              if ((x[0] & 0xF0) != 0x40) return;
+              uint16_t idx = (x[2] << 8) | x[1];
+              uint8_t sub = x[3];
+              if (reg::ist(reg::STATUSBITS, idx, sub)) {
+                uint16_t m = (x[5] << 8) | x[4];
+                id(wem_betriebsart_hk_code).publish_state((float) m);
+                id(wem_betriebsart_hk).publish_state(wc::hk_status_text(m));
+                bf::status().setze(bf::status().hk_bits, (int) m);
+              } else if (reg::ist(reg::VL_SOLL_ANF, idx, sub)) {
+                id(wem_ww_vlsoll).publish_state(reg::wert(reg::VL_SOLL_ANF, (int16_t)((x[5] << 8) | x[4])));
+              } else if (reg::ist(reg::HK_BETRIEBSART, idx, sub)) {
+                // Heizkreis-Betriebsart (JSON MI02 0x2533/02)
+                uint8_t b = x[4];
+                id(hk_betriebsart_code).publish_state((float) b);
+                id(hk_betriebsart).publish_state(wc::hk_name(b, "unbekannt"));
+                bf::status().hk_gelesen(b, id(wcan)->unix_zeit());
+                id(status_gelesen).publish_state(id(wcan)->zeit("%d.%m. %H:%M:%S ") + "gelesen");
+              } else if (reg::ist(reg::RAUMSOLL, idx, sub) || reg::ist(reg::HK_VORLAUF, idx, sub)) {
+                int16_t v = (int16_t)((x[5] << 8) | x[4]);
+                if (v == (int16_t) 0x8000) return;
+                if (reg::ist(reg::RAUMSOLL, idx, sub)) id(hk_raumsoll_akt).publish_state(reg::wert(reg::RAUMSOLL, v));
+                else id(hk_vorlauf).publish_state(reg::wert(reg::HK_VORLAUF, v));
+              }
+
+      # SDO-Antworten Knoten 2 (Kessel)
+      - can_id: 0x582
+        then:
+          - lambda: |-
+              if ((x[0] & 0xF0) != 0x40) return;
+              uint16_t idx = (x[2] << 8) | x[1];
+              uint8_t sub = x[3];
+              int32_t v = (int32_t)((uint32_t)x[7] << 24 | (uint32_t)x[6] << 16 | (uint32_t)x[5] << 8 | (uint32_t)x[4]);
+              if (reg::ist(reg::DRUCK, idx, sub)) id(wem_druck).publish_state(reg::wert(reg::DRUCK, v));
+              else if (reg::ist(reg::LEISTUNG, idx, sub)) id(wem_leistung).publish_state(reg::wert(reg::LEISTUNG, v));
+              else if (reg::ist(reg::DREHZAHL, idx, sub)) id(wem_drehzahl).publish_state(reg::wert(reg::DREHZAHL, v));
+              else if (reg::ist(reg::VORLAUF, idx, sub)) id(wem_vorlauf).publish_state(reg::wert(reg::VORLAUF, v));
+              else if (reg::ist(reg::ABGAS, idx, sub)) id(wem_abgas).publish_state(reg::wert(reg::ABGAS, v));
+              else if (reg::ist(reg::KESSEL_TEMP, idx, sub)) id(wem_kessel).publish_state(reg::wert(reg::KESSEL_TEMP, v));
+              else if (reg::ist(reg::VORLAUF_SOLL, idx, sub)) id(wem_vorlauf_soll).publish_state(reg::wert(reg::VORLAUF_SOLL, v));
+              else if (reg::ist(reg::BRENNER, idx, sub)) {
+                // Betriebsphase Brenner: "Ein" nur mit Flamme (2/3); Flanke 0 -> 1 zaehlt einen Start
+                int ph = v & 0xFF, b = 0;
+                bool start = id(wcan)->brenner.phase(ph, b);
+                id(wem_brennerphase).publish_state((float) ph);
+                id(wem_brenner).publish_state((float) b);
+                id(wem_brenner_text).publish_state(wc::brenner_text(ph));
+                if (start) id(wem_brennerstarts).publish_state((float) id(wcan)->brenner.starts);
+              }
+              else if (reg::ist(reg::VOLUMENSTROM, idx, sub)) id(wem_volumenstrom).publish_state(reg::wert(reg::VOLUMENSTROM, v));
+              else if (reg::ist(reg::WM_HEIZUNG, idx, sub)) id(wem_wm_heizung).publish_state(reg::wert(reg::WM_HEIZUNG, v));
+              else if (reg::ist(reg::WM_WW, idx, sub)) id(wem_wm_ww).publish_state(reg::wert(reg::WM_WW, v));
+              else if (reg::ist(reg::WM_GESAMT, idx, sub)) id(wem_wm_gesamt).publish_state(reg::wert(reg::WM_GESAMT, v));
+      # ===== on_frame aus Paket warmwasser =====
+      # PDO 0x241, Bytes 6-7: Warmwassertemperatur
+      - can_id: 0x241
+        then:
+          - lambda: 'id(wem_warmwasser).publish_state(reg::pdo_wert(reg::WARMWASSER, x));'
+      # PDO 0x182: Kesselstatus 15 = Warmwasserbetrieb
+      - can_id: 0x182
+        then:
+          - lambda: |-
+              bool an = x[reg::KESSELSTATUS.byte] == 15;
+              id(wem_ww_aktiv).publish_state(an ? "Ein" : "Aus");
+              id(wem_ww_aktiv_num).publish_state(an ? 1.0f : 0.0f);
+      - can_id: 0x581
+        then:
+          - lambda: |-
+              if ((x[0] & 0xF0) != 0x40) return;
+              uint16_t idx = (x[2] << 8) | x[1];
+              uint8_t sub = x[3];
+              if (reg::ist(reg::WW_BETRIEBSART, idx, sub)) {
+                // Warmwasser-Betriebsart (JSON MI03 0x2520/02): 1 = Ein, 2 = Aus
+                uint8_t b = x[4];
+                id(ww_betriebsart_code).publish_state((float) b);
+                id(ww_betriebsart).publish_state(wc::ww_name(b, "unbekannt"));
+                bf::status().ww_gelesen(b, id(wcan)->unix_zeit());
+              } else if (reg::ist(reg::WW_SOLL_AKT, idx, sub) || reg::ist(reg::WW_SOLL_NORMAL, idx, sub)) {
+                int16_t v = (int16_t)((x[5] << 8) | x[4]);
+                if (v == (int16_t) 0x8000) return;
+                if (reg::ist(reg::WW_SOLL_AKT, idx, sub)) { float w = reg::wert(reg::WW_SOLL_AKT, v); id(ww_soll_akt).publish_state(w); bf::status().setze_f(bf::status().ww_soll_akt, w); }
+                else { float w = reg::wert(reg::WW_SOLL_NORMAL, v); id(ww_soll_normal).publish_state(w); bf::status().setze_f(bf::status().ww_soll_normal, w); }
+              }
+      # ===== on_frame aus Paket wem-schalten =====
+      - can_id: 0x581
+        then:
+          - lambda: |-
+              if ((x[0] & 0xF0) != 0x40 || !reg::ist(reg::HK_BETRIEBSART, (x[2] << 8) | x[1], x[3])) return;
+              uint8_t b = x[4];
+              if (b >= 1 && b <= 8) id(hk_setzen).publish_state(wc::hk_name(b, "?"));
+              if (id(wcan)->schalten.ziel != 1 || !id(wcan)->schalten.pruefen) return;
+              auto &s = bf::schaltung();
+              s.uhr = id(wcan)->unix_zeit();
+              int soll = s.lauf.wert; std::string q = s.lauf.quelle;
+              s.bus_wert(1, b);
+              std::string zeit = id(wcan)->zeit("%H:%M:%S ");
+              bool ok = b == soll;
+              std::string ist = wc::hk_name(b, "?");
+              id(schalt_status).publish_state(zeit + (ok ? "OK: Heizkreis steht auf " + ist : "NICHT uebernommen, Heizkreis steht auf " + ist));
+              id(protokoll_eintrag)->execute("Heizkreis -> " + std::string(bf::hk_text(soll)) + " (" + q + "): " + (ok ? "ok" : "NICHT uebernommen, steht auf " + ist));
+              id(wcan)->schalten.ziel = 0; id(wcan)->schalten.pruefen = false;
+              id(befehl_melden)->execute();
+      # ===== on_frame aus Paket warmwasser-schalten =====
+      - can_id: 0x581
+        then:
+          - lambda: |-
+              if ((x[0] & 0xF0) != 0x40 || !reg::ist(reg::WW_BETRIEBSART, (x[2] << 8) | x[1], x[3])) return;
+              uint8_t b = x[4];
+              if (b == 1 || b == 2) id(ww_setzen).publish_state(b == 1 ? "Ein" : "Aus");
+              if (id(wcan)->schalten.ziel != 2 || !id(wcan)->schalten.pruefen) return;
+              auto &s = bf::schaltung();
+              s.uhr = id(wcan)->unix_zeit();
+              int soll = s.lauf.wert; std::string q = s.lauf.quelle;
+              s.bus_wert(2, b);
+              std::string zeit = id(wcan)->zeit("%H:%M:%S ");
+              bool ok = b == soll;
+              std::string ist = wc::ww_name(b, "?");
+              id(schalt_status).publish_state(zeit + (ok ? "OK: Warmwasser " + ist : "NICHT uebernommen, Warmwasser " + ist));
+              id(protokoll_eintrag)->execute(std::string("Warmwasser -> ") + bf::ww_text(soll) + " (" + q + "): " + (ok ? "ok" : "NICHT uebernommen, steht auf " + ist));
+              id(wcan)->schalten.ziel = 0; id(wcan)->schalten.pruefen = false; id(wcan)->anlass.anlass_ms = millis() | 1;
+              bf::status().anlass("schaltbefehl", true, true);
+              id(befehl_melden)->execute();
+      # ===== on_frame aus Paket kraiz-per-can =====
+      # SDO-Antworten von WEM (0x581) und Kessel (0x582): was zur Tabelle passt, wird veroeffentlicht
+      - can_id: 0x581
+        then:
+          - lambda: 'kc::antwort(can_id, x);'
+      - can_id: 0x582
+        then:
+          - lambda: 'kc::antwort(can_id, x);'
+      # CANopen-Emergency (0x080 + Knoten): falls die Anlage Fehler so meldet
+      - can_id: 0x081
+        then:
+          - lambda: |-
+              std::string t = kc::hex(x);
+              ESP_LOGW("kraiz", "Emergency Knoten 1: %s", t.c_str());
+              id(kc_emergency).publish_state("WEM " + t);
+      - can_id: 0x082
+        then:
+          - lambda: |-
+              std::string t = kc::hex(x);
+              ESP_LOGW("kraiz", "Emergency Knoten 2: %s", t.c_str());
+              id(kc_emergency).publish_state("Kessel " + t);
